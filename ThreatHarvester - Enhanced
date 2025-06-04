@@ -1,0 +1,611 @@
+# main.py
+# Conceptual main orchestrator for ThreatHarvester - Enhanced
+
+import hashlib
+import json
+import requests # For making HTTP requests to APIs
+import os
+import time
+from datetime import datetime, timedelta
+from uuid import uuid4 # For generating STIX IDs
+
+# Attempt to import stix2, if not available, STIX export will be limited
+try:
+    from stix2 import (Indicator, Malware, Relationship, Bundle, IPv4Address, DomainName, File, URL,
+                       Identity, MarkingDefinition, TLP_WHITE, TLP_GREEN, TLP_AMBER, TLP_RED)
+    STIX2_AVAILABLE = True
+except ImportError:
+    STIX2_AVAILABLE = False
+    print("WARNING: 'stix2' library not found. STIX export will be basic. Install with 'pip install stix2'")
+
+# --- Configuration (Simplified - In a real app, use .env, config files, or Vault) ---
+# General
+OUTPUT_DIR = "collected_iocs"
+LOG_FILE = "threatharvester.log"
+# IOC Feeds - API Keys & URLs (Replace with actuals or secure retrieval methods)
+THREATFOX_API_URL = "https://threatfox.abuse.ch/api/v1/"
+MISP_API_URL = "YOUR_MISP_INSTANCE_URL" # e.g., https://misp.example.com/
+MISP_API_KEY = "YOUR_MISP_API_KEY"
+VT_API_KEY = "YOUR_VIRUSTOTAL_API_KEY"
+ABUSEIPDB_API_KEY = "YOUR_ABUSEIPDB_API_KEY"
+# Database (Conceptual - e.g., PostgreSQL, MongoDB)
+DB_CONNECTION_STRING = "your_db_connection_string_here"
+# Frameworks (Conceptual - FastAPI/Flask for API, Celery for tasks)
+# Containerization (Conceptual - Docker, Docker Compose would wrap this application)
+
+# Create output directory if it doesn't exist
+if not os.path.exists(OUTPUT_DIR):
+    os.makedirs(OUTPUT_DIR)
+
+# --- Logging Utility (Simplified) ---
+def log_message(level, message):
+    """Basic logging function."""
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    log_entry = f"[{timestamp}] [{level.upper()}] {message}\n"
+    print(log_entry.strip()) # Also print to console
+    with open(LOG_FILE, "a", encoding="utf-8") as f:
+        f.write(log_entry)
+
+log_message("info", "ThreatHarvester starting...")
+if not STIX2_AVAILABLE:
+    log_message("warning", "'stix2' library not found. STIX export functionality will be limited.")
+
+# --- Core STIX Objects (Example TLP Markings) ---
+if STIX2_AVAILABLE:
+    TLP_MARKINGS = {
+        "white": MarkingDefinition(definition_type="tlp", definition={"tlp": "white"}),
+        "green": MarkingDefinition(definition_type="tlp", definition={"tlp": "green"}),
+        "amber": MarkingDefinition(definition_type="tlp", definition={"tlp": "amber"}),
+        "red": MarkingDefinition(definition_type="tlp", definition={"tlp": "red"}),
+    }
+    # Default Identity for created objects (replace with your organization's identity)
+    THREAT_HARVESTER_IDENTITY = Identity(
+        name="ThreatHarvester System",
+        identity_class="system",
+        description="Automated IOC & Integrity Collector"
+    )
+else:
+    TLP_MARKINGS = {}
+    THREAT_HARVESTER_IDENTITY = None
+
+# --- IOC Collector Modules ---
+class IOCCollector:
+    """Base class for IOC collectors."""
+    def __init__(self, source_name):
+        self.source_name = source_name
+        self.iocs = [] # Stores collected IOCs as dictionaries
+
+    def fetch(self):
+        """Placeholder for fetching IOCs. To be implemented by subclasses."""
+        raise NotImplementedError("Fetch method not implemented.")
+
+    def get_iocs(self):
+        """Returns collected IOCs."""
+        return self.iocs
+
+class ThreatFoxCollector(IOCCollector):
+    """Collects IOCs from ThreatFox."""
+    def __init__(self):
+        super().__init__("ThreatFox")
+
+    def fetch(self, query_days=1):
+        log_message("info", f"Fetching IOCs from {self.source_name} for the last {query_days} day(s)...")
+        self.iocs = [] # Clear previous results for this fetch
+        try:
+            payload = {'query': 'get_iocs', 'days': query_days}
+            response = requests.post(THREATFOX_API_URL, json=payload, timeout=60)
+            response.raise_for_status()
+            data = response.json()
+            
+            if data.get("query_status") == "ok" and "data" in data:
+                raw_iocs = data["data"]
+                for item in raw_iocs:
+                    # Basic normalization for internal processing
+                    normalized_ioc = {
+                        "id": f"threatharvester--{uuid4()}", # Internal ID
+                        "source": self.source_name,
+                        "ioc_value": item.get("ioc_value"),
+                        "ioc_type": item.get("ioc_type"),
+                        "threat_type": item.get("threat_type"),
+                        "malware_printable": item.get("malware_printable", "N/A"), # ThreatFox specific
+                        "malware_alias": item.get("malware_alias"),
+                        "malware_malpedia": item.get("malware_malpedia"),
+                        "confidence_level": item.get("confidence_level"),
+                        "first_seen_utc": item.get("first_seen_utc"),
+                        "last_seen_utc": item.get("last_seen_utc"),
+                        "reference": item.get("reference"), # e.g., URL to malware bazaar
+                        "tags": item.get("tags", []),
+                        "reporter": item.get("reporter"),
+                        # Placeholder for TLP, default to AMBER if not specified
+                        "tlp": item.get("tlp", "amber").lower() 
+                    }
+                    self.iocs.append(normalized_ioc)
+                log_message("info", f"Successfully fetched {len(self.iocs)} IOCs from {self.source_name}.")
+            elif data.get("query_status"):
+                log_message("error", f"ThreatFox API error: {data.get('query_status')}")
+            else:
+                log_message("error", f"Failed to fetch IOCs from {self.source_name}. Response: {data}")
+        except requests.exceptions.RequestException as e:
+            log_message("error", f"HTTP error fetching from {self.source_name}: {e}")
+        except json.JSONDecodeError as e:
+            log_message("error", f"JSON decode error from {self.source_name}: {e}")
+        except Exception as e:
+            log_message("error", f"An unexpected error occurred with {self.source_name}: {e}")
+        return self.iocs
+
+class MISPCollector(IOCCollector):
+    """Collects IOCs from a MISP instance (Conceptual)."""
+    def __init__(self, api_url, api_key):
+        super().__init__("MISP")
+        self.api_url = api_url
+        self.api_key = api_key
+        if self.api_url == "YOUR_MISP_INSTANCE_URL" or self.api_key == "YOUR_MISP_API_KEY":
+            log_message("warning", "MISP URL or API Key not configured. MISPCollector will be skipped.")
+            self.enabled = False
+        else:
+            self.enabled = True
+
+    def fetch(self, last_days=1):
+        if not self.enabled:
+            log_message("info", f"Skipping {self.source_name} collection (not configured).")
+            return []
+            
+        log_message("info", f"Fetching IOCs from {self.source_name} for the last {last_days} day(s)...")
+        self.iocs = []
+        headers = {"Authorization": self.api_key, "Accept": "application/json"}
+        # Example: Fetch attributes from events published in the last 'last_days'
+        # MISP API allows for complex queries. This is a simplified example.
+        # Common query: /attributes/restSearch/last:{last_days}d/type:ip-src|ip-dst|domain|md5|sha256|url
+        # The exact endpoint and parameters depend on your MISP version and needs.
+        # For this example, let's assume we fetch events and then their attributes.
+        
+        # 1. Fetch recent events
+        events_url = f"{self.api_url}/events/restSearch"
+        # Calculate 'last' parameter for MISP (e.g., '1d', '7d')
+        last_param = f"{last_days}d"
+        event_payload = {"last": last_param, "minimal": True} # Fetch minimal event info first
+
+        try:
+            response = requests.post(events_url, headers=headers, json=event_payload, verify=True, timeout=120) # Add verify=False if using self-signed certs (not recommended for prod)
+            response.raise_for_status()
+            events_data = response.json()
+
+            if "response" in events_data and isinstance(events_data["response"], list):
+                event_ids = [event.get("Event", {}).get("id") for event in events_data["response"] if event.get("Event", {}).get("id")]
+                log_message("info", f"Found {len(event_ids)} events in MISP. Fetching attributes...")
+
+                for event_id in event_ids: # In a real scenario, batch this or use more efficient attribute fetching
+                    attributes_url = f"{self.api_url}/attributes/restSearch/eventid:{event_id}"
+                    attr_response = requests.post(attributes_url, headers=headers, json={}, verify=True, timeout=60) # Empty JSON payload for GET-like behavior via POST
+                    attr_response.raise_for_status()
+                    attributes_data = attr_response.json()
+
+                    if "response" in attributes_data and "Attribute" in attributes_data["response"]:
+                        for attr in attributes_data["response"]["Attribute"]:
+                            # Normalize MISP attribute to our internal format
+                            ioc_type_map = { # MISP type to a more generic/ThreatFox-like type
+                                "ip-src": "ip_address", "ip-dst": "ip_address",
+                                "domain": "domain", "hostname": "domain",
+                                "md5": "md5_hash", "sha1": "sha1_hash", "sha256": "sha256_hash",
+                                "url": "url", "filename": "file_path",
+                                # Add more mappings as needed
+                            }
+                            ioc_type = ioc_type_map.get(attr.get("type"), attr.get("type"))
+                            
+                            # Determine TLP from tags or event
+                            tlp = "amber" # Default
+                            event_tlp_tag = next((tag['name'] for tag in attr.get('Event', {}).get('Tag', []) if tag['name'].startswith('tlp:')), None)
+                            if event_tlp_tag:
+                                tlp = event_tlp_tag.split(':')[1]
+                            
+                            normalized_ioc = {
+                                "id": f"threatharvester--{uuid4()}",
+                                "source": self.source_name,
+                                "ioc_value": attr.get("value"),
+                                "ioc_type": ioc_type,
+                                "threat_type": attr.get("category"), # Or map from MISP taxonomy
+                                "comment": attr.get("comment"),
+                                "first_seen_utc": datetime.fromtimestamp(int(attr.get("first_seen", 0))).isoformat() if attr.get("first_seen") else None,
+                                "last_seen_utc": datetime.fromtimestamp(int(attr.get("last_seen", 0))).isoformat() if attr.get("last_seen") else None,
+                                "misp_event_id": attr.get("event_id"),
+                                "misp_attribute_uuid": attr.get("uuid"),
+                                "tags": [tag["name"] for tag in attr.get("Tag", [])],
+                                "tlp": tlp.lower()
+                            }
+                            self.iocs.append(normalized_ioc)
+                log_message("info", f"Successfully fetched {len(self.iocs)} attributes (IOCs) from {self.source_name}.")
+            else:
+                log_message("error", f"Failed to fetch events from {self.source_name}. Response: {events_data}")
+
+        except requests.exceptions.RequestException as e:
+            log_message("error", f"HTTP error fetching from {self.source_name}: {e}")
+        except json.JSONDecodeError as e:
+            log_message("error", f"JSON decode error from {self.source_name}: {e}")
+        except Exception as e:
+            log_message("error", f"An unexpected error occurred with {self.source_name}: {e}")
+        return self.iocs
+
+# --- Data Integrity Modules ---
+class IntegrityVerifier:
+    """Handles data integrity verification."""
+    # hashlib is already used. PyCryptodome could be used for more advanced crypto like digital signatures.
+
+    @staticmethod
+    def get_file_hash(filepath, algorithm="sha256"):
+        hash_func = getattr(hashlib, algorithm, None)
+        if not hash_func:
+            log_message("error", f"Unsupported hash algorithm: {algorithm}")
+            return None
+        h = hash_func()
+        try:
+            with open(filepath, "rb") as f:
+                while chunk := f.read(8192):
+                    h.update(chunk)
+            hex_digest = h.hexdigest()
+            log_message("debug", f"Calculated {algorithm} hash for {filepath}: {hex_digest}")
+            return hex_digest
+        except FileNotFoundError:
+            log_message("error", f"File not found for hashing: {filepath}")
+            return None
+        except Exception as e:
+            log_message("error", f"Error hashing file {filepath}: {e}")
+            return None
+    # Conceptual: Log collection with checksum validation (e.g., Windows Event Logs, syslog, Zeek logs)
+    # Conceptual: Chain of custody/forensic hashing (optional blockchain-style timestamping for integrity)
+
+# --- Aggregation & Normalization & Enrichment Module (IOC Processor) ---
+class IOCProcessor:
+    def __init__(self):
+        self.all_iocs_raw = [] # List of dicts from collectors
+        self.deduplicated_iocs_stix = {} # STIX objects, key: STIX ID
+        self.relationships_stix = [] # STIX relationships
+        self.sightings_stix = [] # STIX sightings (if applicable)
+
+    def add_iocs_raw(self, ioc_list_dicts):
+        if ioc_list_dicts:
+            self.all_iocs_raw.extend(ioc_list_dicts)
+            log_message("info", f"Added {len(ioc_list_dicts)} raw IOCs to the processor.")
+
+    def _create_stix_indicator(self, ioc_data):
+        """Converts an internal IOC dictionary to a STIX Indicator object."""
+        if not STIX2_AVAILABLE: return None
+
+        pattern = None
+        pattern_type = "stix"
+        name = f"{ioc_data.get('ioc_type', 'unknown')}: {ioc_data.get('ioc_value', 'N/A')}"
+        description = f"Source: {ioc_data.get('source')}. Threat Type: {ioc_data.get('threat_type', 'N/A')}."
+        if ioc_data.get('comment'): description += f" Comment: {ioc_data.get('comment')}"
+        if ioc_data.get('malware_printable'): description += f" Malware: {ioc_data.get('malware_printable')}"
+
+        confidence = ioc_data.get('confidence_level')
+        if confidence is not None:
+            try:
+                confidence = int(confidence)
+                if not (0 <= confidence <= 100): confidence = None # STIX confidence is 0-100
+            except ValueError:
+                confidence = None
+        
+        valid_from = ioc_data.get('first_seen_utc', datetime.utcnow().isoformat())
+        if isinstance(valid_from, str): # Ensure datetime object for stix2
+             try: valid_from = datetime.fromisoformat(valid_from.replace("Z", "+00:00"))
+             except: valid_from = datetime.utcnow() # Fallback
+
+        # Map IOC types to STIX patterns
+        ioc_type = ioc_data.get('ioc_type')
+        ioc_value = ioc_data.get('ioc_value')
+
+        if ioc_type == 'ip_address' or ioc_type == 'ipv4-addr': # ThreatFox uses 'ip:port' sometimes
+            ip_value = ioc_value.split(':')[0] if ':' in ioc_value else ioc_value
+            pattern = f"[ipv4-addr:value = '{ip_value}']"
+            if ':' in ioc_value: # Handle ip:port
+                port_value = ioc_value.split(':')[1]
+                pattern += f" AND [network-traffic:dst_port_ref.value = '{port_value}']" # Example, adjust as needed
+        elif ioc_type == 'domain':
+            pattern = f"[domain-name:value = '{ioc_value}']"
+        elif ioc_type == 'url':
+            pattern = f"[url:value = '{ioc_value}']"
+        elif ioc_type == 'md5_hash':
+            pattern = f"[file:hashes.MD5 = '{ioc_value}']"
+        elif ioc_type == 'sha1_hash':
+            pattern = f"[file:hashes.SHA1 = '{ioc_value}']"
+        elif ioc_type == 'sha256_hash':
+            pattern = f"[file:hashes.SHA256 = '{ioc_value}']"
+        # Add more types: file paths, mutexes, etc.
+        # else: log_message("warning", f"Unsupported ioc_type for STIX pattern: {ioc_type}")
+
+        if pattern:
+            indicator_id = f"indicator--{uuid4()}" # Generate STIX compliant ID
+            
+            # TLP Marking
+            tlp_str = ioc_data.get("tlp", "amber").lower() # Default to amber
+            object_marking_refs = [TLP_MARKINGS.get(tlp_str, TLP_MARKINGS["amber"])]
+
+
+            indicator = Indicator(
+                id=indicator_id,
+                created_by_ref=THREAT_HARVESTER_IDENTITY.id if THREAT_HARVESTER_IDENTITY else None,
+                created=datetime.utcnow(),
+                modified=datetime.utcnow(),
+                name=name,
+                description=description,
+                pattern_type=pattern_type,
+                pattern=pattern,
+                valid_from=valid_from,
+                confidence=confidence,
+                object_marking_refs=object_marking_refs,
+                labels=ioc_data.get('tags', []) + [ioc_data.get('threat_type', '').lower().replace(" ", "-")]
+            )
+            
+            # Conceptual: Add Malware SDO and Relationship if malware info exists
+            malware_name = ioc_data.get("malware_printable") or ioc_data.get("malware_alias")
+            if malware_name and STIX2_AVAILABLE:
+                malware_id = Malware.generate_id(name=malware_name) # Deterministic ID if possible
+                malware_sdo = Malware(
+                    id=malware_id,
+                    created_by_ref=THREAT_HARVESTER_IDENTITY.id if THREAT_HARVESTER_IDENTITY else None,
+                    is_family=False, # Assume not family unless specified
+                    name=malware_name,
+                    object_marking_refs=object_marking_refs,
+                )
+                # Check if malware SDO already exists to avoid duplicates in bundle
+                if malware_id not in self.deduplicated_iocs_stix:
+                     self.deduplicated_iocs_stix[malware_id] = malware_sdo
+
+                rel = Relationship(
+                    indicator,
+                    'indicates',
+                    malware_sdo,
+                    object_marking_refs=object_marking_refs,
+                    created_by_ref=THREAT_HARVESTER_IDENTITY.id if THREAT_HARVESTER_IDENTITY else None,
+                )
+                self.relationships_stix.append(rel)
+
+            return indicator
+        return None
+
+    def normalize_to_stix_and_deduplicate(self):
+        """Normalizes raw IOCs to STIX Indicator objects and deduplicates."""
+        log_message("info", "Normalizing IOCs to STIX and deduplicating...")
+        newly_processed_stix_count = 0
+        for raw_ioc in self.all_iocs_raw:
+            stix_indicator = self._create_stix_indicator(raw_ioc)
+            if stix_indicator:
+                # Deduplication based on STIX ID (which is unique per object)
+                # More robust deduplication might involve comparing patterns or values if IDs are not stable across sources
+                if stix_indicator.id not in self.deduplicated_iocs_stix:
+                    self.deduplicated_iocs_stix[stix_indicator.id] = stix_indicator
+                    newly_processed_stix_count += 1
+                # else: IOC already processed (or a collision, less likely with UUIDs)
+        
+        self.all_iocs_raw = [] # Clear raw IOCs after processing
+        log_message("info", f"STIX normalization and deduplication complete. Total unique STIX objects: {len(self.deduplicated_iocs_stix)}. New this run: {newly_processed_stix_count}")
+        return list(self.deduplicated_iocs_stix.values())
+
+
+    def enrich_ioc_stix(self, stix_object):
+        """
+        Enriches a STIX object (conceptual).
+        E.g., query VirusTotal, AbuseIPDB, WHOIS.
+        This would typically add External References or modify properties like 'confidence'.
+        """
+        if not STIX2_AVAILABLE: return stix_object # Cannot enrich if stix2 is not available
+
+        log_message("debug", f"Attempting to enrich STIX object: {stix_object.id} (conceptual)")
+        # Example: If it's an Indicator with an IP, query AbuseIPDB
+        # This is highly conceptual and needs actual API calls and STIX object modification
+        # if stix_object.type == "indicator" and VT_API_KEY != "YOUR_VIRUSTOTAL_API_KEY":
+        #    if "[ipv4-addr:value = " in stix_object.pattern:
+        #        # Extract IP, query VT, add external reference or update confidence
+        #        pass
+        return stix_object
+    
+    # Conceptual: Machine learning for IOC scoring and prioritization
+    # Conceptual: YARA rule integration for proactive detection
+    # Conceptual: Natural language IOC extraction from CTI reports (would be a collector type)
+    # Conceptual: Threat actor tagging and correlation (e.g., MITRE ATT&CK mapping)
+
+# --- Output & Export Module ---
+class OutputManager:
+    def __init__(self, output_directory):
+        self.output_dir = output_directory
+
+    def export_to_json(self, ioc_list_dicts, filename_prefix="iocs_generic"):
+        if not ioc_list_dicts:
+            log_message("warning", "No generic IOC dictionaries to export to JSON.")
+            return
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filepath = os.path.join(self.output_dir, f"{filename_prefix}_{timestamp}.json")
+        try:
+            with open(filepath, "w", encoding="utf-8") as f:
+                json.dump(ioc_list_dicts, f, indent=4)
+            log_message("info", f"Successfully exported {len(ioc_list_dicts)} generic IOCs to {filepath}")
+        except Exception as e:
+            log_message("error", f"Error exporting generic IOCs to JSON: {e}")
+
+    def export_to_stix_bundle(self, stix_objects, relationships, filename_prefix="iocs_stix_bundle"):
+        if not STIX2_AVAILABLE:
+            log_message("error", "Cannot export to STIX: stix2 library not available.")
+            return
+        if not stix_objects and not relationships :
+            log_message("warning", "No STIX objects or relationships to export.")
+            return
+
+        all_stix_for_bundle = list(stix_objects) + list(relationships)
+        if THREAT_HARVESTER_IDENTITY:
+            all_stix_for_bundle.append(THREAT_HARVESTER_IDENTITY)
+        for tlp_marking in TLP_MARKINGS.values(): # Add TLP definitions to bundle
+            all_stix_for_bundle.append(tlp_marking)
+        
+        # Deduplicate by ID before creating bundle
+        final_bundle_objects = list({obj.id: obj for obj in all_stix_for_bundle}.values())
+
+
+        bundle = Bundle(objects=final_bundle_objects, allow_custom=True) # allow_custom for any non-standard properties if used
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filepath = os.path.join(self.output_dir, f"{filename_prefix}_{timestamp}.json")
+        try:
+            with open(filepath, "w", encoding="utf-8") as f:
+                f.write(bundle.serialize(pretty=True))
+            log_message("info", f"Successfully exported STIX bundle with {len(final_bundle_objects)} objects to {filepath}")
+        except Exception as e:
+            log_message("error", f"Error exporting STIX bundle: {e}")
+    
+    # Conceptual: CSV export
+    # Conceptual: Integrate with OpenCTI or MISP for correlation (would be like a collector but for sending data)
+
+# --- Automation Engine (Conceptual - Celery would be used for robust tasks) ---
+class AutomationEngine:
+    def __init__(self, processor, output_manager):
+        self.collectors = []
+        self.processor = processor
+        self.output_manager = output_manager
+
+    def add_collector(self, collector_instance):
+        self.collectors.append(collector_instance)
+
+    def run_scheduled_collection(self, interval_seconds=3600): # e.g., 1 hour
+        log_message("info", f"Automation engine starting. Collection interval: {interval_seconds}s")
+        while True:
+            log_message("info", "Starting scheduled IOC collection run...")
+            current_raw_iocs = []
+            for collector in self.collectors:
+                try:
+                    fetched_iocs = [] # This will be list of dicts
+                    if isinstance(collector, ThreatFoxCollector):
+                        fetched_iocs = collector.fetch(query_days=1) # Fetch last 1 day for scheduled runs
+                    elif isinstance(collector, MISPCollector):
+                         if collector.enabled:
+                            fetched_iocs = collector.fetch(last_days=1)
+                    # Add other collector types here
+                    else:
+                        fetched_iocs = collector.fetch()
+                    
+                    if fetched_iocs:
+                        current_raw_iocs.extend(fetched_iocs)
+                except Exception as e:
+                    log_message("error", f"Error during collection with {collector.source_name}: {e}")
+            
+            if current_raw_iocs:
+                self.processor.add_iocs_raw(current_raw_iocs)
+                # Normalization to STIX and deduplication happens here
+                self.processor.normalize_to_stix_and_deduplicate() 
+
+                # Enrichment (conceptual)
+                # for stix_id, stix_obj in self.processor.deduplicated_iocs_stix.items():
+                #    self.processor.deduplicated_iocs_stix[stix_id] = self.processor.enrich_ioc_stix(stix_obj)
+                
+                # Exporting the STIX bundle
+                self.output_manager.export_to_stix_bundle(
+                    self.processor.deduplicated_iocs_stix.values(),
+                    self.processor.relationships_stix,
+                    "scheduled_run_stix_bundle"
+                )
+                # Optionally, export the raw/internal JSON format too
+                # self.output_manager.export_to_json(current_raw_iocs, "scheduled_run_raw_iocs")
+
+                # Clear processor's STIX objects for the next run if you only want deltas,
+                # or accumulate if you want a growing set. For now, let's clear for per-run outputs.
+                # However, deduplication logic should ideally compare against a persistent store.
+                self.processor.deduplicated_iocs_stix = {} 
+                self.processor.relationships_stix = []
+            else:
+                log_message("info", "No new IOCs fetched in this scheduled run.")
+
+            log_message("info", f"Scheduled run complete. Next run in {interval_seconds} seconds.")
+            time.sleep(interval_seconds)
+
+# --- Main Application Logic ---
+def main():
+    log_message("info", "Initializing ThreatHarvester components...")
+
+    # 1. Initialize Collectors
+    threatfox_collector = ThreatFoxCollector()
+    misp_collector = MISPCollector(MISP_API_URL, MISP_API_KEY)
+    # Add other collectors (OTX, AbuseIPDB direct feed, etc.)
+
+    # 2. Initialize IOC Processor
+    ioc_processor = IOCProcessor()
+
+    # 3. Initialize Output Manager
+    output_mgr = OutputManager(OUTPUT_DIR)
+    
+    # --- Example: One-off collection run ---
+    log_message("info", "Performing a single IOC collection run...")
+    
+    # Fetch from ThreatFox (last 2 days for a broader initial pull)
+    tf_raw_iocs = threatfox_collector.fetch(query_days=2)
+    if tf_raw_iocs:
+        ioc_processor.add_iocs_raw(tf_raw_iocs)
+    
+    # Fetch from MISP (if configured)
+    if misp_collector.enabled:
+        misp_raw_iocs = misp_collector.fetch(last_days=2)
+        if misp_raw_iocs:
+            ioc_processor.add_iocs_raw(misp_raw_iocs)
+
+    # Normalize all collected raw IOCs to STIX and deduplicate
+    ioc_processor.normalize_to_stix_and_deduplicate()
+    
+    # Conceptual enrichment
+    # final_stix_objects_enriched = []
+    # for stix_obj in ioc_processor.deduplicated_iocs_stix.values():
+    #    final_stix_objects_enriched.append(ioc_processor.enrich_ioc_stix(stix_obj.copy(deep=True)))
+    
+    # Export collected and processed STIX data
+    output_mgr.export_to_stix_bundle(
+        ioc_processor.deduplicated_iocs_stix.values(),
+        ioc_processor.relationships_stix,
+        "manual_run_stix_bundle"
+    )
+    # Also export the initially collected raw data (now empty as it's processed)
+    # For raw export before STIX conversion, you'd do it earlier or keep a copy.
+
+    # --- Example: File Hashing ---
+    log_message("info", "Performing file integrity check example...")
+    dummy_file_path = "sample_file_to_hash.txt"
+    try:
+        with open(dummy_file_path, "w", encoding="utf-8") as df:
+            df.write("This is a test file for ThreatHarvester integrity check.")
+        IntegrityVerifier.get_file_hash(dummy_file_path, "sha256")
+        os.remove(dummy_file_path)
+    except Exception as e:
+        log_message("error", f"Error in file hashing example: {e}")
+
+    # --- To run scheduled collection (uncomment and ensure collectors are correctly added) ---
+    # log_message("info", "Starting automation engine for scheduled collection...")
+    # automation_engine = AutomationEngine(ioc_processor, output_mgr) # Use a fresh processor for scheduler if needed
+    # automation_engine.add_collector(ThreatFoxCollector()) 
+    # if MISP_API_KEY != "YOUR_MISP_API_KEY": # Only add if configured
+    #    automation_engine.add_collector(MISPCollector(MISP_API_URL, MISP_API_KEY))
+    # try:
+    #    automation_engine.run_scheduled_collection(interval_seconds=60*60*1) # e.g., every 1 hour
+    # except KeyboardInterrupt:
+    #    log_message("info", "Automation engine stopped by user.")
+    # except Exception as e:
+    #    log_message("critical", f"Automation engine crashed: {e}")
+
+    log_message("info", "ThreatHarvester run finished.")
+
+if __name__ == "__main__":
+    # Ensure you have `requests` and `stix2` installed: pip install requests stix2
+    main()
+
+# --- Further Development Considerations based on User Request ---
+# Language/Framework: Python (FastAPI/Flask for API, Celery for automation) - This script is Python.
+#   - FastAPI/Flask: Would wrap this logic to provide API endpoints for triggering collections, fetching IOCs, etc.
+#   - Celery: Would replace the simple `AutomationEngine` loop for robust, distributed task scheduling.
+# Database: PostgreSQL or MongoDB
+#   - IOCs (STIX objects or normalized JSON) would be stored here instead of just files.
+#   - The IOCProcessor would query the DB for existing IOCs for more robust deduplication.
+# IOC Storage Format: STIX 2.1 + JSON (STIX is primary, JSON can be a raw or simplified form).
+# IOC Feeds: MISP, OpenCTI, OTX, ThreatFox, AbuseIPDB - ThreatFox and MISP conceptualized. Others would be new collectors.
+# Integrity Check: hashlib (used), PyCryptodome (for advanced crypto like digital signatures on exports).
+# Containerization: Docker, Docker Compose - Dockerfiles would be created to package this app and its dependencies.
+# Advanced Features:
+#   - Machine learning for IOC scoring/prioritization: Would be a new module in IOCProcessor, likely training a model on IOC features and known outcomes.
+#   - YARA rule integration: Could involve collecting YARA rules, or generating YARA rules from IOCs.
+#   - Natural language IOC extraction: A collector that parses text reports (PDF, web) using NLP libraries (spaCy, NLTK) to find IOC patterns.
+#   - Threat actor tagging and correlation (MITRE ATT&CK): Mapping IOCs/Malware to ATT&CK techniques and known actors. STIX supports this.
+# Digital signatures for output reports: Use PyCryptodome or GPG.
+# Role-based access and audit logging: If this becomes a multi-user platform (likely with a FastAPI/Flask frontend).
+# TLS/SSL-secured data flows: `requests` uses HTTPS by default. Ensure all external/internal API calls are over TLS.
