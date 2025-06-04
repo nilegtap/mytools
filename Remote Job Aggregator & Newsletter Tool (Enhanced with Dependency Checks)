@@ -1,0 +1,643 @@
+# remote_job_tool.py
+# An enhanced tool to find remote jobs, generate a newsletter, and send it.
+# Uses SQLite for seen jobs, includes basic error reporting, and auto-dependency checks.
+
+import tkinter as tk
+from tkinter import ttk, scrolledtext, messagebox, filedialog
+import json
+import os
+import smtplib # Standard library
+from email.mime.multipart import MIMEMultipart # Standard library
+from email.mime.text import MIMEText # Standard library
+import time # Standard library
+import threading # Standard library
+from datetime import datetime # Standard library
+import hashlib # Standard library
+import sqlite3 # Standard library
+import subprocess # Standard library
+import sys # Standard library
+
+# --- Global flags for package availability ---
+BS4_AVAILABLE = False
+REQUESTS_AVAILABLE = False
+SCHEDULE_AVAILABLE = False
+PIP_AVAILABLE = False # New flag for pip availability
+
+# --- Function to check pip availability ---
+def check_pip_availability():
+    """Checks if pip is available and runnable."""
+    global PIP_AVAILABLE
+    try:
+        print("Checking pip availability...")
+        subprocess.check_call([sys.executable, "-m", "pip", "--version"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        print("pip is available.")
+        PIP_AVAILABLE = True
+        return True
+    except subprocess.CalledProcessError:
+        print("Error: pip is not available or not runnable with the current Python interpreter.")
+        print(f"  Attempted to run: '{sys.executable} -m pip --version'")
+        print("  Please ensure pip is installed and configured correctly for your Python environment.")
+        PIP_AVAILABLE = False
+        return False
+    except FileNotFoundError: # Handles cases where sys.executable might be problematic or pip module itself not found by python -m
+        print(f"Error: Could not find '{sys.executable}' or the pip module itself.")
+        print("  Please ensure your Python installation is correct and pip is installed.")
+        PIP_AVAILABLE = False
+        return False
+
+
+# --- Function to check and install packages ---
+def check_and_install_package(package_name, import_name=None):
+    """
+    Checks if a package is available, tries to import it. If not found and pip is available, attempts to install it.
+    Returns True if the package is available after the check, False otherwise.
+    """
+    if import_name is None:
+        import_name = package_name
+
+    try:
+        __import__(import_name)
+        print(f"Package '{import_name}' is already available.")
+        return True
+    except ImportError:
+        print(f"Module '{import_name}' (from package '{package_name}') not found.")
+        if not PIP_AVAILABLE:
+            print(f"Cannot attempt to install '{package_name}' because pip is not available.")
+            return False
+        try:
+            print(f"Attempting to install '{package_name}' using pip...")
+            subprocess.check_call([sys.executable, "-m", "pip", "install", package_name])
+            print(f"Package '{package_name}' installed successfully.")
+            # Try importing again to confirm
+            __import__(import_name)
+            print(f"Successfully imported '{import_name}' after installation.")
+            return True
+        except subprocess.CalledProcessError as e:
+            print(f"Error during pip install for '{package_name}': {e}")
+            print(f"Failed to install '{package_name}' automatically. Please install it manually:")
+            print(f"  '{sys.executable} -m pip install {package_name}'")
+            return False
+        except ImportError:
+            print(f"Still unable to import '{import_name}' after attempting install. Manual installation required.")
+            return False
+        except Exception as e:
+            print(f"An unexpected error occurred during installation or import of '{package_name}': {e}")
+            return False
+
+# --- Initial Dependency Checks ---
+print("--- Initializing Dependencies ---")
+check_pip_availability() # Check pip first
+
+BS4_AVAILABLE = check_and_install_package(package_name="beautifulsoup4", import_name="bs4")
+REQUESTS_AVAILABLE = check_and_install_package(package_name="requests")
+SCHEDULE_AVAILABLE = check_and_install_package(package_name="schedule")
+print("--- Dependency Initialization Complete ---")
+
+# Conditional import based on availability
+if BS4_AVAILABLE:
+    from bs4 import BeautifulSoup
+if REQUESTS_AVAILABLE:
+    import requests
+if SCHEDULE_AVAILABLE:
+    import schedule
+
+
+# --- Configuration Management ---
+CONFIG_FILE = "job_tool_config.json"
+DB_FILE = "jobs_database.db" 
+LOG_FILE = "job_tool.log" 
+
+DEFAULT_CONFIG = {
+    "search_keywords": ["remote", "work from home", "wfh", "distributed"],
+    "target_sites": [
+        {"name": "ExampleJobSite1 (Conceptual Requests)", "url_template": "https://example.com/jobs?q={keyword}&location=remote", "enabled": True, "scraper_type": "requests"},
+        {"name": "ExampleJobSite2 (Conceptual Selenium)", "url_template": "https://dynamicjobsite.com/search?term={keyword}&remote=true", "enabled": False, "scraper_type": "selenium_example"}
+    ],
+    "email_settings": {
+        "smtp_server": "smtp.example.com",
+        "smtp_port": 587,
+        "smtp_user": "your_email@example.com",
+        "smtp_password": "your_password",
+        "sender_email": "your_email@example.com",
+        "receiver_email": "recipient_email@example.com",
+        "newsletter_subject": "Daily Remote Job Digest",
+        "error_notification_email": "admin_email@example.com" 
+    },
+    "schedule_time": "08:00", 
+}
+
+def load_config():
+    if os.path.exists(CONFIG_FILE):
+        try:
+            with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        except json.JSONDecodeError:
+            log_message("Error: Could not decode config file. Using default.")
+            return DEFAULT_CONFIG
+    return DEFAULT_CONFIG
+
+def save_config(config_data):
+    try:
+        with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
+            json.dump(config_data, f, indent=4)
+        log_message("Configuration saved.")
+    except Exception as e:
+        log_message(f"Error saving configuration: {e}")
+
+# --- Database Setup & Operations ---
+def init_db():
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        cursor = conn.cursor()
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS seen_jobs (
+                job_id TEXT PRIMARY KEY,
+                first_seen_timestamp TEXT
+            )
+        ''')
+        conn.commit()
+        log_message(f"Database {DB_FILE} initialized successfully.")
+    except sqlite3.Error as e:
+        log_message(f"Database Error during init: {e}")
+    finally:
+        if conn: conn.close()
+
+def add_seen_job_to_db(job_id):
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        cursor = conn.cursor()
+        timestamp = datetime.now().isoformat()
+        cursor.execute("INSERT OR IGNORE INTO seen_jobs (job_id, first_seen_timestamp) VALUES (?, ?)", (job_id, timestamp))
+        conn.commit()
+    except sqlite3.Error as e:
+        log_message(f"Database Error adding job_id {job_id}: {e}")
+    finally:
+        if conn: conn.close()
+
+def is_job_seen_in_db(job_id):
+    seen = False
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        cursor = conn.cursor()
+        cursor.execute("SELECT 1 FROM seen_jobs WHERE job_id = ?", (job_id,))
+        seen = cursor.fetchone() is not None
+    except sqlite3.Error as e:
+        log_message(f"Database Error checking job_id {job_id}: {e}")
+    finally:
+        if conn: conn.close()
+    return seen
+
+# --- Job Scraping ---
+class JobScraper:
+    def __init__(self):
+        self.headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36 RemoteJobAggregatorTool/1.2'}
+        if not PIP_AVAILABLE:
+             log_message("WARNING: pip is not available. Automatic package installation for dependencies will not work.")
+        if not REQUESTS_AVAILABLE:
+            log_message("CRITICAL: 'requests' library is not available. Web scraping will largely fail.")
+        if not BS4_AVAILABLE:
+            log_message("WARNING: BeautifulSoup4 (bs4) is not available. 'requests' scraper type will fail if used.")
+
+    def fetch_jobs_from_site_requests(self, site_config, keywords):
+        if not REQUESTS_AVAILABLE:
+            log_message(f"Skipping Requests scrape for {site_config['name']} as 'requests' library is not available.")
+            return []
+        if not BS4_AVAILABLE:
+            log_message(f"Skipping Requests scrape for {site_config['name']} as BeautifulSoup4 is not available.")
+            return []
+            
+        jobs_found = []
+        log_message(f"Scraping (Requests) {site_config['name']} for keywords: {', '.join(keywords)}")
+        query_keyword = "+".join(k.replace(" ", "+") for k in keywords)
+        url = site_config["url_template"].replace("{keyword}", query_keyword)
+        
+        try:
+            response = requests.get(url, headers=self.headers, timeout=30)
+            response.raise_for_status()
+            soup = BeautifulSoup(response.content, 'html.parser')
+
+            job_listings_elements = soup.find_all('div', class_='job-listing-item') # Replace
+            
+            for job_element in job_listings_elements:
+                title_element = job_element.find('a', class_='job-title-link') # Replace
+                company_element = job_element.find('span', class_='company-name-text') # Replace
+                link_element = title_element 
+                location_element = job_element.find('div', class_='job-location') # Replace
+
+                title = title_element.text.strip() if title_element else "N/A"
+                company = company_element.text.strip() if company_element else "N/A"
+                job_url = link_element['href'] if link_element and link_element.has_attr('href') else "#"
+                
+                if job_url.startswith('/') and "://" not in site_config["url_template"]: 
+                     base_url_parts = site_config["url_template"].split('/')
+                     base_url = f"{base_url_parts[0]}//{base_url_parts[2]}"
+                     job_url = base_url + job_url
+                elif job_url.startswith('/') and "://" in site_config["url_template"]: 
+                    if REQUESTS_AVAILABLE: # requests.utils is part of requests
+                        parsed_original_url = requests.utils.urlparse(site_config["url_template"])
+                        base_url = f"{parsed_original_url.scheme}://{parsed_original_url.netloc}"
+                        job_url = base_url + job_url
+                    else: 
+                        log_message("Warning: requests.utils not available for URL parsing because 'requests' is missing.")
+
+
+                location = location_element.text.strip() if location_element else "N/A"
+                
+                is_truly_remote = any(kw.lower() in title.lower() or kw.lower() in location.lower() or "remote" in location.lower() for kw in keywords)
+                if not is_truly_remote:
+                    continue 
+
+                job_unique_str = f"{site_config['name']}_{title}_{company}_{job_url}"
+                job_hashed_id = hashlib.md5(job_unique_str.encode('utf-8')).hexdigest()
+                
+                jobs_found.append({
+                    "id": job_hashed_id, "title": title, "company": company, "url": job_url,
+                    "location": location, "source": site_config['name'], "scraped_at": datetime.now().isoformat()
+                })
+                if len(jobs_found) >= 30: break 
+            log_message(f"Found {len(jobs_found)} potential jobs from {site_config['name']} (Requests).")
+        except requests.exceptions.RequestException as e: 
+            log_message(f"Requests Error scraping {site_config['name']}: {e}")
+        except NameError as e: 
+             log_message(f"NameError during scraping {site_config['name']} (likely missing library like 'requests' or 'BeautifulSoup'): {e}")
+        except Exception as e:
+            log_message(f"Unexpected error processing {site_config['name']} (Requests): {e}")
+        return jobs_found
+
+    def fetch_jobs_with_selenium_example(self, site_config, keywords):
+        jobs_found = []
+        log_message(f"Attempting Selenium scrape for {site_config['name']} (Conceptual)...")
+        # Conceptual: Check for selenium library here if implementing
+        # SELENIUM_AVAILABLE = check_and_install_package("selenium") # This would need to be global or passed
+        # if not SELENIUM_AVAILABLE:
+        #     log_message("Selenium library not found or install failed. Skipping Selenium scrape.")
+        #     return []
+        log_message(f"Selenium part for {site_config['name']} is conceptual. Needs full implementation and 'selenium' library.")
+        return jobs_found
+
+    def get_all_jobs(self, config):
+        all_jobs = []
+        if not PIP_AVAILABLE:
+            log_message("WARNING: pip is not available. Cannot automatically install missing scraper dependencies if needed.")
+
+        requests_scraper_enabled = any(s.get("scraper_type") == "requests" and s.get("enabled") for s in config.get("target_sites",[]))
+        if requests_scraper_enabled and not REQUESTS_AVAILABLE:
+            log_message("Cannot perform 'requests' type scraping because 'requests' library is unavailable.")
+        
+        for site in config.get("target_sites", []):
+            if site.get("enabled", False):
+                scraper_type = site.get("scraper_type", "requests").lower()
+                if scraper_type == "requests":
+                    if not REQUESTS_AVAILABLE or not BS4_AVAILABLE:
+                        log_message(f"Skipping site {site['name']} (requests type) due to missing 'requests' or 'bs4'.")
+                        continue
+                    jobs = self.fetch_jobs_from_site_requests(site, config.get("search_keywords", ["remote"]))
+                elif scraper_type == "selenium_example":
+                    jobs = self.fetch_jobs_with_selenium_example(site, config.get("search_keywords", ["remote"]))
+                else:
+                    log_message(f"Unknown scraper type '{scraper_type}' for site {site['name']}. Skipping.")
+                    continue
+                all_jobs.extend(jobs)
+        return all_jobs
+
+# --- Job Processing & Deduplication (using DB) ---
+def filter_new_jobs(jobs):
+    new_jobs = []
+    for job in jobs:
+        job_unique_id = job["id"]
+        if not is_job_seen_in_db(job_unique_id):
+            new_jobs.append(job)
+            add_seen_job_to_db(job_unique_id) 
+    return new_jobs
+
+# --- Newsletter Generation ---
+def generate_newsletter_html(jobs):
+    if not jobs: return "<p>No new remote jobs found today. Check back tomorrow!</p>"
+    html_content = "<html><head><style>"
+    html_content += """
+        body { font-family: Arial, sans-serif; margin: 20px; background-color: #f8f9fa; color: #333; }
+        .container { max-width: 700px; margin: auto; background-color: #fff; padding: 20px; border-radius: 8px; box-shadow: 0 0 15px rgba(0,0,0,0.1); }
+        h2 { color: #0056b3; text-align: center; border-bottom: 2px solid #0056b3; padding-bottom: 10px; }
+        .job-item { background-color: #fff; border: 1px solid #e0e0e0; border-left: 5px solid #007bff; margin-bottom: 20px; padding: 15px; border-radius: 5px; box-shadow: 0 2px 4px rgba(0,0,0,0.05); }
+        .job-item h3 { margin-top: 0; color: #0056b3; font-size: 1.2em; }
+        .job-item p { margin-bottom: 8px; color: #555; line-height: 1.6; }
+        .job-item strong { color: #333; } .job-item a { color: #007bff; text-decoration: none; font-weight: bold; }
+        .job-item a:hover { text-decoration: underline; color: #004494; }
+        .footer { margin-top: 30px; text-align: center; font-size: 0.9em; color: #777; }
+        .highlight { background-color: #e7f3ff; padding: 2px 4px; border-radius: 3px; font-weight: bold;}
+    """
+    html_content += "</style></head><body><div class='container'>"
+    html_content += "<h2>Today's Remote Job Digest</h2>"
+    for job in jobs:
+        html_content += f"<div class='job-item'><h3>{job.get('title', 'N/A')}</h3>"
+        html_content += f"<p><strong>Company:</strong> {job.get('company', 'N/A')}</p>"
+        html_content += f"<p><strong>Location:</strong> <span class='highlight'>{job.get('location', 'N/A')}</span></p>"
+        html_content += f"<p><strong>Source:</strong> {job.get('source', 'N/A')}</p>"
+        html_content += f"<p><a href='{job.get('url', '#')}' target='_blank'>View Job & Apply &raquo;</a></p></div>"
+    html_content += "<div class='footer'><p>Remote Job Aggregator - Happy Job Hunting!</p></div></div></body></html>"
+    return html_content
+
+# --- Email Sending ---
+def send_email(config, subject, html_body, recipient_email_override=None):
+    email_conf = config.get("email_settings", {})
+    if not all([email_conf.get(k) for k in ["smtp_server", "smtp_port", "smtp_user", "smtp_password", "sender_email"]]):
+        log_message("Core email settings incomplete. Cannot send email."); return False
+    actual_recipient = recipient_email_override if recipient_email_override else email_conf.get("receiver_email")
+    if not actual_recipient: log_message("Recipient email missing."); return False
+    msg = MIMEMultipart('alternative'); msg['Subject'] = subject; msg['From'] = email_conf["sender_email"]; msg['To'] = actual_recipient
+    part_html = MIMEText(html_body, 'html', 'utf-8'); msg.attach(part_html)
+    try:
+        log_message(f"Connecting SMTP: {email_conf['smtp_server']}:{email_conf['smtp_port']} for {actual_recipient}...")
+        with smtplib.SMTP(email_conf["smtp_server"], email_conf["smtp_port"]) as server:
+            server.starttls(); server.login(email_conf["smtp_user"], email_conf["smtp_password"])
+            server.sendmail(email_conf["sender_email"], actual_recipient, msg.as_string())
+        log_message(f"Email '{subject}' sent to {actual_recipient}."); return True
+    except smtplib.SMTPAuthenticationError as e: log_message(f"SMTP Auth Error: {e}. Check credentials."); return False
+    except Exception as e: log_message(f"Error sending email to {actual_recipient}: {e}"); return False
+
+def send_newsletter_email(config, html_content):
+    return send_email(config, config.get("email_settings", {}).get("newsletter_subject", "Remote Job Digest"), html_content)
+
+def send_error_notification_email(config, error_message_details):
+    error_recipient = config.get("email_settings", {}).get("error_notification_email")
+    if not error_recipient: log_message("Error notification email not configured."); return False
+    subject = "Critical Error in Remote Job Aggregator Tool"
+    body = f"""<html><body><h2>Critical Error</h2><p>Timestamp: {datetime.now().isoformat()}</p>
+    <p><strong>Error Details:</strong></p><pre>{error_message_details}</pre>
+    <p>Check logs ({LOG_FILE}).</p></body></html>"""
+    log_message(f"Attempting error notification to {error_recipient}.")
+    return send_email(config, subject, body, recipient_email_override=error_recipient)
+
+# --- Main Task & Scheduling ---
+app_config = load_config() 
+
+def run_job_collection_and_send_newsletter():
+    log_message("Starting job collection and newsletter process...")
+    global app_config 
+    
+    requests_needed = any(s.get("scraper_type") == "requests" and s.get("enabled") for s in app_config.get("target_sites",[]))
+    critical_dependency_missing = False
+    err_msg_parts = []
+
+    if not PIP_AVAILABLE:
+        err_msg_parts.append("pip is not available (cannot auto-install dependencies)")
+        critical_dependency_missing = True # If pip is gone, can't install others
+
+    if requests_needed:
+        if not REQUESTS_AVAILABLE:
+            err_msg_parts.append("'requests' library")
+            critical_dependency_missing = True
+        if not BS4_AVAILABLE:
+            err_msg_parts.append("'beautifulsoup4' library")
+            critical_dependency_missing = True
+    
+    if critical_dependency_missing:
+        final_err_msg = "Critical dependencies missing or pip unavailable: " + ", ".join(err_msg_parts) + "."
+        log_message(f"CRITICAL: {final_err_msg} Aborting job collection.")
+        send_error_notification_email(app_config, f"{final_err_msg} Scrapers cannot run effectively.")
+        return
+    try:
+        scraper = JobScraper()
+        raw_jobs = scraper.get_all_jobs(app_config)
+        if not raw_jobs: log_message("No jobs found from any source."); return
+        log_message(f"Raw jobs collected: {len(raw_jobs)}")
+        new_jobs = filter_new_jobs(raw_jobs)
+        if not new_jobs: log_message("No *new* jobs found (all previously seen)."); return
+        log_message(f"New jobs for newsletter: {len(new_jobs)}")
+        newsletter_html = generate_newsletter_html(new_jobs)
+        with open("newsletter_preview.html", "w", encoding="utf-8") as f: f.write(newsletter_html)
+        log_message("Newsletter HTML preview saved.")
+        send_newsletter_email(app_config, newsletter_html)
+        log_message("Job collection and newsletter process finished successfully.")
+    except Exception as e:
+        error_details = f"Critical error in main task:\n{type(e).__name__}: {e}"
+        log_message(error_details)
+        import traceback
+        log_message(f"Traceback:\n{traceback.format_exc()}")
+        send_error_notification_email(app_config, error_details + "\n\n" + traceback.format_exc())
+
+# --- GUI Application ---
+class JobToolApp:
+    def __init__(self, root):
+        self.root = root; self.root.title("Remote Job Newsletter Tool (Enhanced v3)"); self.root.geometry("850x750")
+        self.config = load_config(); self.style = ttk.Style(); self.style.theme_use('clam')
+        self.style.configure("TButton", padding=6, relief="flat", font=('Arial', 10))
+        self.style.configure("TLabel", padding=2, font=('Arial', 10))
+        self.style.configure("Header.TLabel", font=('Arial', 16, 'bold'))
+        self.style.configure("Small.TLabel", font=('Arial', 8))
+        self.notebook = ttk.Notebook(root)
+        self.tab_dashboard = ttk.Frame(self.notebook, padding=10); self.tab_settings = ttk.Frame(self.notebook, padding=10)
+        self.tab_logs = ttk.Frame(self.notebook, padding=10)
+        self.notebook.add(self.tab_dashboard, text='Dashboard'); self.notebook.add(self.tab_settings, text='Settings')
+        self.notebook.add(self.tab_logs, text='Logs'); self.notebook.pack(expand=True, fill='both', padx=10, pady=10)
+        self.create_dashboard_tab(); self.create_settings_tab(); self.create_logs_tab()
+        
+        if not PIP_AVAILABLE: self.log_to_gui("CRITICAL: pip is not available. Automatic package installation failed.")
+        if not REQUESTS_AVAILABLE: self.log_to_gui("Warning: 'requests' library not found/installed. Web scraping will fail.")
+        if not BS4_AVAILABLE: self.log_to_gui("Warning: 'beautifulsoup4' (bs4) not found/installed. 'requests' scrapers will fail.")
+        if not SCHEDULE_AVAILABLE: self.log_to_gui("Warning: 'schedule' library not found/installed. Automated scheduling will fail.")
+
+        self.scheduler_thread = None; self.stop_scheduler_event = threading.Event()
+        if SCHEDULE_AVAILABLE: self.initialize_scheduler()
+        else: self.log_to_gui("Automated scheduler disabled due to missing 'schedule' library.")
+        self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
+
+    def create_dashboard_tab(self):
+        frame = self.tab_dashboard
+        ttk.Label(frame, text="Job Automation Control", style="Header.TLabel").pack(pady=15)
+        ttk.Button(frame, text="Run Manually Now", command=self.manual_run, style="TButton").pack(pady=10, ipadx=10, ipady=5)
+        status_frame = ttk.Frame(frame); status_frame.pack(pady=10)
+        ttk.Label(status_frame, text="Scheduler Status:", style="TLabel").pack(side=tk.LEFT, padx=5)
+        self.status_label = ttk.Label(status_frame, text="Idle" if SCHEDULE_AVAILABLE else "Disabled (schedule lib missing)", style="TLabel"); self.status_label.pack(side=tk.LEFT)
+        next_run_frame = ttk.Frame(frame); next_run_frame.pack(pady=5)
+        ttk.Label(next_run_frame, text="Next Scheduled Run:", style="TLabel").pack(side=tk.LEFT, padx=5)
+        self.next_run_label = ttk.Label(next_run_frame, text="N/A", style="TLabel"); self.next_run_label.pack(side=tk.LEFT)
+        if SCHEDULE_AVAILABLE: self.update_next_run_label()
+
+    def create_settings_tab(self):
+        frame = self.tab_settings; main_settings_frame = ttk.Frame(frame); main_settings_frame.pack(fill=tk.BOTH, expand=True)
+        settings_canvas = tk.Canvas(main_settings_frame, borderwidth=0, background="#ffffff")
+        settings_scrollbar = ttk.Scrollbar(main_settings_frame, orient="vertical", command=settings_canvas.yview)
+        scrollable_content_frame = ttk.Frame(settings_canvas)
+        scrollable_content_frame.bind("<Configure>", lambda e: settings_canvas.configure(scrollregion=settings_canvas.bbox("all"), width=e.width))
+        settings_canvas.create_window((0, 0), window=scrollable_content_frame, anchor="nw")
+        settings_canvas.configure(yscrollcommand=settings_scrollbar.set)
+        general_frame = ttk.LabelFrame(scrollable_content_frame, text="General Settings", padding=10)
+        general_frame.grid(row=0, column=0, padx=10, pady=10, sticky="ew", columnspan=2)
+        ttk.Label(general_frame, text="Search Keywords (comma-separated):").grid(row=0, column=0, padx=5, pady=5, sticky="w")
+        self.keywords_entry = ttk.Entry(general_frame, width=70); self.keywords_entry.grid(row=0, column=1, padx=5, pady=5, sticky="ew")
+        self.keywords_entry.insert(0, ", ".join(self.config.get("search_keywords", [])))
+        ttk.Label(general_frame, text="Daily Schedule Time (HH:MM):").grid(row=1, column=0, padx=5, pady=5, sticky="w")
+        self.schedule_time_entry = ttk.Entry(general_frame, width=15); self.schedule_time_entry.grid(row=1, column=1, padx=5, pady=5, sticky="w")
+        self.schedule_time_entry.insert(0, self.config.get("schedule_time", "08:00"))
+        sites_frame = ttk.LabelFrame(scrollable_content_frame, text="Target Job Sites", padding=10)
+        sites_frame.grid(row=1, column=0, padx=10, pady=10, sticky="nsew", columnspan=2)
+        ttk.Label(sites_frame, text="Configure in job_tool_config.json (JSON format):", style="Small.TLabel").pack(anchor="w", pady=(0,5))
+        self.sites_text = tk.Text(sites_frame, height=10, width=80, relief=tk.SOLID, borderwidth=1, font=('Courier New', 9))
+        self.sites_text.pack(fill="x", expand=True); self.sites_text.insert(tk.END, json.dumps(self.config.get("target_sites", []), indent=2))
+        email_frame = ttk.LabelFrame(scrollable_content_frame, text="Email Configuration", padding=10)
+        email_frame.grid(row=2, column=0, padx=10, pady=10, sticky="ew", columnspan=2)
+        email_conf = self.config.get("email_settings", {})
+        email_fields = [
+            ("SMTP Server:", "smtp_server", email_conf.get("smtp_server", "")), ("SMTP Port:", "smtp_port", str(email_conf.get("smtp_port", 587))),
+            ("SMTP User (Email):", "smtp_user", email_conf.get("smtp_user", "")), ("SMTP Password:", "smtp_password", email_conf.get("smtp_password", ""), True),
+            ("Sender Email:", "sender_email", email_conf.get("sender_email", "")), ("Newsletter Recipient Email:", "receiver_email", email_conf.get("receiver_email", "")),
+            ("Newsletter Subject:", "newsletter_subject", email_conf.get("newsletter_subject", "")), ("Error Notification Email:", "error_notification_email", email_conf.get("error_notification_email", ""))
+        ]
+        self.email_entries = {}
+        for i, (label_text, key, value, *is_password) in enumerate(email_fields):
+            ttk.Label(email_frame, text=label_text).grid(row=i, column=0, padx=5, pady=3, sticky="w")
+            entry = ttk.Entry(email_frame, width=50, show="*" if is_password else ""); entry.grid(row=i, column=1, padx=5, pady=3, sticky="ew")
+            entry.insert(0, value); self.email_entries[key] = entry
+        email_frame.grid_columnconfigure(1, weight=1)
+        save_button_frame = ttk.Frame(scrollable_content_frame)
+        save_button_frame.grid(row=3, column=0, columnspan=2, pady=20, sticky="ew")
+        ttk.Button(save_button_frame, text="Save All Settings", command=self.save_settings_from_gui, style="TButton").pack()
+        scrollable_content_frame.grid_columnconfigure(0, weight=1); scrollable_content_frame.grid_columnconfigure(1, weight=1)
+        settings_canvas.pack(side="left", fill="both", expand=True); settings_scrollbar.pack(side="right", fill="y")
+
+    def create_logs_tab(self):
+        frame = self.tab_logs
+        ttk.Label(frame, text="Application Logs", style="Header.TLabel").pack(pady=10)
+        self.log_text_area = scrolledtext.ScrolledText(frame, wrap=tk.WORD, width=90, height=25, state=tk.DISABLED, relief=tk.SOLID, borderwidth=1, font=('Courier New', 9))
+        self.log_text_area.pack(pady=10, padx=10, fill="both", expand=True)
+
+    def log_to_gui(self, message): log_message(message) 
+
+    def _update_gui_log_area(self, message):
+        if hasattr(self, 'log_text_area') and self.log_text_area.winfo_exists():
+            self.log_text_area.config(state=tk.NORMAL)
+            self.log_text_area.insert(tk.END, f"{datetime.now().strftime('%H:%M:%S')} - {message}\n")
+            self.log_text_area.see(tk.END); self.log_text_area.config(state=tk.DISABLED)
+
+    def save_settings_from_gui(self):
+        global app_config
+        self.config["search_keywords"] = [kw.strip() for kw in self.keywords_entry.get().split(',') if kw.strip()]
+        try: self.config["target_sites"] = json.loads(self.sites_text.get("1.0", tk.END))
+        except json.JSONDecodeError: messagebox.showerror("Error", "Invalid JSON in Target Sites."); return
+        for key, entry_widget in self.email_entries.items(): self.config["email_settings"][key] = entry_widget.get()
+        try: self.config["email_settings"]["smtp_port"] = int(self.email_entries["smtp_port"].get())
+        except ValueError: messagebox.showerror("Error", "SMTP Port must be a number."); return
+        self.config["schedule_time"] = self.schedule_time_entry.get()
+        app_config = self.config.copy(); save_config(self.config)
+        self.log_to_gui("Settings saved. Scheduler (if active) will use new settings on next cycle or app restart.")
+        messagebox.showinfo("Success", "Settings saved!"); self.update_next_run_label()
+
+    def manual_run(self):
+        # Consolidate dependency checks for manual run
+        requests_needed = any(s.get("scraper_type") == "requests" and s.get("enabled") for s in app_config.get("target_sites",[]))
+        dependency_issue = False
+        if not PIP_AVAILABLE:
+            self.log_to_gui("Manual run aborted: pip is not available. Cannot ensure dependencies.")
+            messagebox.showerror("Dependency Error", "pip is not available. Cannot ensure dependencies for scrapers.")
+            dependency_issue = True
+        if requests_needed and (not REQUESTS_AVAILABLE or not BS4_AVAILABLE):
+            self.log_to_gui("Manual run aborted: 'requests' or 'bs4' library missing for enabled 'requests' scrapers.")
+            messagebox.showerror("Dependency Error", "Cannot run: 'requests' or 'beautifulsoup4' library is missing and required for active scrapers.")
+            dependency_issue = True
+        
+        if dependency_issue:
+            return
+
+        self.log_to_gui("Manual run triggered...")
+        threading.Thread(target=run_job_collection_and_send_newsletter, daemon=True).start()
+
+    def scheduler_loop(self):
+        global app_config; log_message("Scheduler thread started.")
+        current_schedule_time = app_config.get("schedule_time", "08:00")
+        if not SCHEDULE_AVAILABLE: log_message("Scheduler loop cannot run: 'schedule' library missing."); return
+        
+        schedule.clear()
+        try:
+            schedule.every().day.at(current_schedule_time).do(run_job_collection_and_send_newsletter)
+            if self.root.winfo_exists():
+                self.root.after(0, lambda: self.status_label.config(text=f"Scheduler: Running (Next at {current_schedule_time})"))
+                self.root.after(0, self.update_next_run_label)
+        except Exception as e: 
+            log_message(f"Error setting initial schedule for {current_schedule_time}: {e}")
+            if self.root.winfo_exists(): self.root.after(0, lambda: self.status_label.config(text=f"Scheduler: Error - Invalid time"))
+        
+        while not self.stop_scheduler_event.is_set():
+            new_config_time = app_config.get("schedule_time")
+            if new_config_time != current_schedule_time:
+                log_message(f"Schedule time change: Old {current_schedule_time}, New {new_config_time}")
+                current_schedule_time = new_config_time; schedule.clear()
+                try:
+                    schedule.every().day.at(current_schedule_time).do(run_job_collection_and_send_newsletter)
+                    log_message(f"Scheduler re-armed for: {current_schedule_time}")
+                    if self.root.winfo_exists(): self.root.after(0, lambda t=current_schedule_time: self.status_label.config(text=f"Scheduler: Running (Next at {t})"))
+                except Exception as e:
+                    log_message(f"Error re-scheduling for {current_schedule_time}: {e}")
+                    if self.root.winfo_exists(): self.root.after(0, lambda: self.status_label.config(text=f"Scheduler: Error - Invalid time"))
+            schedule.run_pending()
+            if self.root.winfo_exists(): self.root.after(1000, self.update_next_run_label)
+            time.sleep(20) 
+        log_message("Scheduler thread stopped.")
+        if self.root.winfo_exists(): self.root.after(0, lambda: self.status_label.config(text="Scheduler Status: Stopped"))
+
+    def initialize_scheduler(self):
+        if not SCHEDULE_AVAILABLE:
+            self.log_to_gui("Cannot initialize scheduler: 'schedule' library is missing.")
+            self.status_label.config(text="Scheduler: Disabled (Lib missing)")
+            return
+        if self.scheduler_thread and self.scheduler_thread.is_alive(): self.log_to_gui("Scheduler already running."); return
+        self.stop_scheduler_event.clear()
+        self.scheduler_thread = threading.Thread(target=self.scheduler_loop, daemon=True); self.scheduler_thread.start()
+        self.log_to_gui("Scheduler initialized and started."); self.update_next_run_label()
+
+    def update_next_run_label(self):
+        if not hasattr(self, 'next_run_label') or not self.next_run_label.winfo_exists(): return
+        if not SCHEDULE_AVAILABLE or not schedule.jobs: # Check schedule.jobs directly
+            self.next_run_label.config(text="N/A (Scheduler inactive or lib missing)")
+            return
+        try:
+            next_run_dt = schedule.next_run()
+            if next_run_dt: self.next_run_label.config(text=f"{next_run_dt.strftime('%Y-%m-%d %H:%M:%S')}")
+            else: self.next_run_label.config(text="Not scheduled (job ran or error)")
+        except Exception as e: self.next_run_label.config(text="Error fetching next run"); log_message(f"Error updating next run label: {e}")
+
+    def on_closing(self):
+        if messagebox.askokcancel("Quit", "Do you want to quit? This will stop the scheduler."):
+            self.log_to_gui("Application shutting down...")
+            self.stop_scheduler_event.set()
+            if self.scheduler_thread and self.scheduler_thread.is_alive():
+                self.log_to_gui("Waiting for scheduler thread to stop..."); self.scheduler_thread.join(timeout=5)
+            self.root.destroy()
+
+_gui_app_instance_for_logging = None
+def set_global_gui_app_instance(app_instance): global _gui_app_instance_for_logging; _gui_app_instance_for_logging = app_instance
+
+def log_message(message):
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S"); log_entry = f"[{timestamp}] {message}"; print(log_entry) 
+    try:
+        with open(LOG_FILE, "a", encoding="utf-8") as f: f.write(log_entry + "\n")
+    except Exception as e: print(f"Critical: Failed to write to log file {LOG_FILE}: {e}")
+    if _gui_app_instance_for_logging and hasattr(_gui_app_instance_for_logging, 'root') and _gui_app_instance_for_logging.root.winfo_exists():
+        try: _gui_app_instance_for_logging.root.after(0, lambda m=message: _gui_app_instance_for_logging._update_gui_log_area(m))
+        except Exception as e: print(f"Error logging to GUI (from global log_message): {e}")
+
+if __name__ == "__main__":
+    # Dependency checks are now at the top.
+    dependency_warning_messages = []
+    if not PIP_AVAILABLE: dependency_warning_messages.append("- pip (package installer) is not available. Cannot auto-install other dependencies.")
+    if not REQUESTS_AVAILABLE: dependency_warning_messages.append("- requests (for web scraping)")
+    if not BS4_AVAILABLE: dependency_warning_messages.append("- beautifulsoup4 (for parsing HTML)")
+    if not SCHEDULE_AVAILABLE: dependency_warning_messages.append("- schedule (for automated runs)")
+
+    if dependency_warning_messages:
+        full_warning = "One or more critical dependencies could not be installed/found or pip is unavailable:\n"
+        full_warning += "\n".join(dependency_warning_messages)
+        full_warning += "\n\nSome features of the application will be disabled or may not work correctly. Please address these issues manually."
+        print(f"--- WARNING ---\n{full_warning}\n---------------")
+        # Optionally show a Tkinter popup if Tkinter itself is available and other criticals are missing.
+        # This popup should only appear if the GUI itself can run but core functions will be crippled.
+        # For simplicity, console print is the primary notification for pre-GUI issues.
+        
+    init_db()
+    with open(LOG_FILE, "a", encoding="utf-8") as f: f.write(f"\n--- Application Started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ---\n")
+    main_root = tk.Tk()
+    app = JobToolApp(main_root)
+    set_global_gui_app_instance(app) 
+    app.log_to_gui("Application GUI started and database initialized.") # This will use the new logging flow
+    main_root.mainloop()
+    log_message("Application GUI closed.")
