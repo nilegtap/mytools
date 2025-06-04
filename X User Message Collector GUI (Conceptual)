@@ -1,0 +1,314 @@
+# x_message_collector_gui.py
+# A conceptual tool with a GUI to collect messages posted by a user from X (formerly Twitter).
+# The actual X API interaction part is a placeholder and needs to be implemented by the user.
+
+import tkinter as tk
+from tkinter import ttk, scrolledtext, messagebox
+import json
+import os
+import threading
+from datetime import datetime
+import subprocess # For dependency checks
+import sys # For dependency checks
+
+# --- Global flag for package availability ---
+REQUESTS_AVAILABLE = False
+
+# --- Function to check and install packages ---
+def check_and_install_package(package_name, import_name=None):
+    """
+    Checks if a package is available, tries to import it. If not found and pip is available, attempts to install it.
+    Returns True if the package is available after the check, False otherwise.
+    """
+    global PIP_AVAILABLE # Assuming PIP_AVAILABLE is checked elsewhere or we check it here
+    if import_name is None:
+        import_name = package_name
+
+    try:
+        __import__(import_name)
+        print(f"Package '{import_name}' is already available.")
+        return True
+    except ImportError:
+        print(f"Module '{import_name}' (from package '{package_name}') not found.")
+        
+        # Check pip availability (simplified check here, could be more robust)
+        pip_works = False
+        try:
+            subprocess.check_call([sys.executable, "-m", "pip", "--version"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            pip_works = True
+        except (subprocess.CalledProcessError, FileNotFoundError):
+            print("pip does not seem to be available or runnable. Cannot auto-install packages.")
+            return False
+
+        if not pip_works:
+             return False
+
+        try:
+            print(f"Attempting to install '{package_name}' using pip...")
+            subprocess.check_call([sys.executable, "-m", "pip", "install", package_name])
+            print(f"Package '{package_name}' installed successfully.")
+            __import__(import_name) # Try importing again
+            print(f"Successfully imported '{import_name}' after installation.")
+            return True
+        except subprocess.CalledProcessError as e:
+            print(f"Error during pip install for '{package_name}': {e}")
+            print(f"Failed to install '{package_name}' automatically. Please install it manually:")
+            print(f"  '{sys.executable} -m pip install {package_name}'")
+            return False
+        except ImportError:
+            print(f"Still unable to import '{import_name}' after attempting install. Manual installation required.")
+            return False
+        except Exception as e:
+            print(f"An unexpected error occurred during installation or import of '{package_name}': {e}")
+            return False
+
+# --- Check Dependencies ---
+print("--- Checking Dependencies ---")
+REQUESTS_AVAILABLE = check_and_install_package(package_name="requests")
+print("--- Dependency Check Complete ---")
+
+if REQUESTS_AVAILABLE:
+    import requests
+else:
+    print("WARNING: 'requests' library is not available. API calls will fail if not implemented differently.")
+
+# --- Configuration (Placeholder for API Keys) ---
+# In a real application, store these securely (e.g., environment variables, config file with restricted access)
+X_BEARER_TOKEN = "YOUR_X_BEARER_TOKEN_HERE" # Replace with your actual Bearer Token
+
+# --- X API Interaction (Placeholder) ---
+def fetch_tweets_from_x_api(username, bearer_token, count=20):
+    """
+    Placeholder function to fetch tweets for a given username using the X API v2.
+    This function needs to be implemented with actual X API calls.
+    It should handle authentication, rate limits, and error responses.
+    """
+    log_message_gui(f"Attempting to fetch tweets for @{username}...")
+
+    if not REQUESTS_AVAILABLE:
+        log_message_gui("Error: 'requests' library is not installed. Cannot make API calls.")
+        messagebox.showerror("Dependency Error", "'requests' library is missing. Please install it.")
+        return {"error": "Requests library missing."}
+
+    if bearer_token == "YOUR_X_BEARER_TOKEN_HERE" or not bearer_token:
+        log_message_gui("Error: X API Bearer Token is not configured.")
+        messagebox.showerror("Configuration Error", "X API Bearer Token is not set. Please configure it in the script.")
+        return {"error": "API token not configured."}
+
+    # --- Actual X API v2 Implementation Would Go Here ---
+    # 1. Get User ID from Username:
+    #    Endpoint: GET https://api.twitter.com/2/users/by/username/:username
+    #    Headers: {"Authorization": f"Bearer {bearer_token}"}
+    #
+    # 2. Get User's Tweets (Timeline) by User ID:
+    #    Endpoint: GET https://api.twitter.com/2/users/:id/tweets
+    #    Parameters: e.g., tweet.fields=created_at, max_results=count
+    #    Headers: {"Authorization": f"Bearer {bearer_token}"}
+    
+    # Example using requests (conceptual structure):
+    # Get User ID
+    user_lookup_url = f"https://api.twitter.com/2/users/by/username/{username}"
+    headers = {"Authorization": f"Bearer {bearer_token}"}
+    
+    try:
+        response_user = requests.get(user_lookup_url, headers=headers, timeout=10)
+        response_user.raise_for_status() # Raise an exception for HTTP errors (4xx or 5xx)
+        user_data = response_user.json()
+        
+        if "data" not in user_data or "id" not in user_data["data"]:
+            log_message_gui(f"Error: Could not find user ID for @{username}. Response: {user_data.get('errors', user_data)}")
+            return {"error": f"User @{username} not found or API error.", "details": user_data}
+        
+        user_id = user_data["data"]["id"]
+        log_message_gui(f"Found User ID for @{username}: {user_id}")
+
+        # Get User's Tweets
+        tweets_url = f"https://api.twitter.com/2/users/{user_id}/tweets"
+        params = {
+            "tweet.fields": "created_at,text", # Specify which fields you want
+            "max_results": min(count, 100), # Max 100 per request for user tweets timeline
+            # "exclude": "retweets,replies" # Optional: to exclude retweets/replies
+        }
+        response_tweets = requests.get(tweets_url, headers=headers, params=params, timeout=15)
+        response_tweets.raise_for_status()
+        tweets_data = response_tweets.json()
+
+        if "data" in tweets_data:
+            log_message_gui(f"Successfully fetched {len(tweets_data['data'])} tweets for @{username}.")
+            return {"success": True, "tweets": tweets_data["data"]}
+        elif "errors" in tweets_data:
+            log_message_gui(f"API error fetching tweets for @{username}: {tweets_data['errors']}")
+            return {"error": "API error fetching tweets.", "details": tweets_data["errors"]}
+        else:
+            log_message_gui(f"No tweets found or unexpected response for @{username}: {tweets_data}")
+            return {"success": True, "tweets": []} # No data but not an error
+
+    except requests.exceptions.HTTPError as http_err:
+        log_message_gui(f"HTTP error occurred: {http_err} - {http_err.response.text}")
+        try:
+            error_details = http_err.response.json()
+        except ValueError:
+            error_details = http_err.response.text
+        return {"error": f"HTTP error: {http_err.response.status_code}", "details": error_details}
+    except requests.exceptions.RequestException as req_err:
+        log_message_gui(f"Request exception occurred: {req_err}")
+        return {"error": f"Request failed: {req_err}"}
+    except Exception as e:
+        log_message_gui(f"An unexpected error occurred: {e}")
+        return {"error": f"Unexpected error: {e}"}
+
+    # --- End of Placeholder ---
+    # Mock data for demonstration if API call is not implemented:
+    # log_message_gui("Using mock data as API interaction is a placeholder.")
+    # mock_tweets = [
+    #     {"created_at": "2023-10-26T10:00:00Z", "text": f"This is a mock tweet 1 from @{username}."},
+    #     {"created_at": "2023-10-25T12:30:00Z", "text": f"Hello from X! - @{username} (mock)"},
+    # ]
+    # return {"success": True, "tweets": mock_tweets}
+
+
+# --- GUI Application ---
+class XMessageCollectorApp:
+    def __init__(self, root_window):
+        self.root = root_window
+        self.root.title("X User Message Collector (Conceptual)")
+        self.root.geometry("700x600")
+
+        # Style
+        self.style = ttk.Style()
+        self.style.theme_use('clam')
+        self.style.configure("TButton", padding=5, font=('Arial', 10))
+        self.style.configure("TLabel", padding=3, font=('Arial', 10))
+        self.style.configure("Header.TLabel", font=('Arial', 14, 'bold'))
+
+        # --- Input Frame ---
+        input_frame = ttk.Frame(self.root, padding="10 10 10 10")
+        input_frame.pack(fill=tk.X)
+
+        ttk.Label(input_frame, text="X Username (without @):", style="TLabel").pack(side=tk.LEFT, padx=(0, 5))
+        self.username_entry = ttk.Entry(input_frame, width=30, font=('Arial', 10))
+        self.username_entry.pack(side=tk.LEFT, expand=True, fill=tk.X, padx=5)
+        
+        self.fetch_button = ttk.Button(input_frame, text="Fetch Tweets", command=self.trigger_fetch_tweets)
+        self.fetch_button.pack(side=tk.LEFT, padx=5)
+
+        # --- Tweets Display Area ---
+        ttk.Label(self.root, text="Collected Tweets:", style="Header.TLabel").pack(pady=(10,0))
+        self.tweets_display_frame = ttk.Frame(self.root, padding="10 0 10 10")
+        self.tweets_display_frame.pack(fill=tk.BOTH, expand=True)
+
+        self.tweets_text_area = scrolledtext.ScrolledText(self.tweets_display_frame, wrap=tk.WORD, width=80, height=20, font=('Arial', 10), relief=tk.SOLID, borderwidth=1)
+        self.tweets_text_area.pack(fill=tk.BOTH, expand=True)
+        self.tweets_text_area.config(state=tk.DISABLED)
+
+        # --- Status Bar ---
+        self.status_bar = ttk.Label(self.root, text="Status: Idle", relief=tk.SUNKEN, anchor=tk.W, padding=5)
+        self.status_bar.pack(side=tk.BOTTOM, fill=tk.X)
+
+        # Set global GUI logger
+        global _gui_logger_func_ref
+        _gui_logger_func_ref = self._log_to_status_bar_thread_safe
+
+    def _log_to_status_bar_thread_safe(self, message):
+        """Internal method to update status bar from any thread."""
+        if hasattr(self, 'status_bar') and self.status_bar.winfo_exists():
+            self.status_bar.config(text=f"Status: {message}")
+
+    def display_tweets(self, tweets_data):
+        self.tweets_text_area.config(state=tk.NORMAL)
+        self.tweets_text_area.delete('1.0', tk.END)
+
+        if tweets_data.get("error"):
+            error_msg = f"Error: {tweets_data['error']}"
+            if "details" in tweets_data:
+                 error_msg += f"\nDetails: {json.dumps(tweets_data['details'], indent=2)}"
+            self.tweets_text_area.insert(tk.END, error_msg)
+            log_message_gui(error_msg.split('\n')[0]) # Log first line of error
+        elif tweets_data.get("success") and tweets_data.get("tweets"):
+            tweets = tweets_data["tweets"]
+            if not tweets:
+                self.tweets_text_area.insert(tk.END, "No tweets found for this user or matching criteria.")
+                log_message_gui("No tweets found.")
+            else:
+                for tweet in tweets:
+                    timestamp_str = tweet.get("created_at", "N/A")
+                    # Try to parse and reformat timestamp if possible
+                    try:
+                        dt_obj = datetime.fromisoformat(timestamp_str.replace("Z", "+00:00"))
+                        formatted_time = dt_obj.strftime("%Y-%m-%d %H:%M:%S %Z")
+                    except ValueError:
+                        formatted_time = timestamp_str # Fallback to original string
+
+                    display_line = f"[{formatted_time}] {tweet.get('text', 'N/A')}\n---\n"
+                    self.tweets_text_area.insert(tk.END, display_line)
+                log_message_gui(f"Displayed {len(tweets)} tweets.")
+        elif tweets_data.get("success") and not tweets_data.get("tweets"):
+             self.tweets_text_area.insert(tk.END, "No tweets found for this user.")
+             log_message_gui("No tweets found for user.")
+        else:
+            self.tweets_text_area.insert(tk.END, "No data received or unexpected response.")
+            log_message_gui("No data or unexpected response.")
+            
+        self.tweets_text_area.config(state=tk.DISABLED)
+
+    def fetch_tweets_thread_target(self, username):
+        self.fetch_button.config(state=tk.DISABLED)
+        self.username_entry.config(state=tk.DISABLED)
+        log_message_gui(f"Fetching tweets for @{username}...")
+
+        # Call the placeholder/API interaction function
+        # Pass the Bearer Token from the global config
+        fetched_data = fetch_tweets_from_x_api(username, X_BEARER_TOKEN)
+        
+        # Update GUI from the main thread
+        self.root.after(0, self.display_tweets, fetched_data)
+        self.root.after(0, lambda: self.fetch_button.config(state=tk.NORMAL))
+        self.root.after(0, lambda: self.username_entry.config(state=tk.NORMAL))
+        if "error" not in fetched_data:
+             self.root.after(0, lambda: log_message_gui("Fetching complete."))
+        else:
+             self.root.after(0, lambda: log_message_gui("Fetching failed. See details above."))
+
+
+    def trigger_fetch_tweets(self):
+        username = self.username_entry.get().strip()
+        if not username:
+            messagebox.showwarning("Input Error", "Please enter an X username.")
+            return
+        
+        # Run fetching in a separate thread to keep GUI responsive
+        thread = threading.Thread(target=self.fetch_tweets_thread_target, args=(username,), daemon=True)
+        thread.start()
+
+# --- Global Logging for GUI ---
+# This allows functions outside the GUI class to update the status bar
+_gui_logger_func_ref = None 
+def log_message_gui(message):
+    """Logs a message to the GUI status bar if available."""
+    print(f"GUI_LOG: {message}") # Also print to console for debugging
+    if _gui_logger_func_ref:
+        # Ensure GUI update is called from the main thread using `after`
+        # This check is more complex as _gui_logger_func_ref is a bound method.
+        # We need to access its __self__.root (the Tkinter root window).
+        if hasattr(_gui_logger_func_ref, '__self__') and \
+           hasattr(_gui_logger_func_ref.__self__, 'root') and \
+           _gui_logger_func_ref.__self__.root.winfo_exists():
+            _gui_logger_func_ref.__self__.root.after(0, lambda m=message: _gui_logger_func_ref(m))
+
+if __name__ == "__main__":
+    if not REQUESTS_AVAILABLE:
+        # Show a pre-GUI error if critical dependencies are missing
+        root_check = tk.Tk()
+        root_check.withdraw() # Hide the dummy root window
+        messagebox.showerror("Critical Dependency Missing", 
+                             "'requests' library is not installed and could not be auto-installed.\n"
+                             "The application cannot function without it.\n\n"
+                             "Please install it manually (e.g., 'pip install requests') and restart.")
+        root_check.destroy()
+        sys.exit("Exiting due to missing 'requests' library.")
+
+    root = tk.Tk()
+    app = XMessageCollectorApp(root)
+    log_message_gui("Application started. Enter an X username and click 'Fetch Tweets'.")
+    root.mainloop()
+    log_message_gui("Application closed.")
